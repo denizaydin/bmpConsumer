@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package bmpmessage;
+
+option go_package = "bmpConsumer/proto";  // Specify the Go package path
+
+// EVPNPrefix message for evpn topic
+message EVPNPrefix {
+    string prefix = 1;
+    string nexthop = 2;
+}
+
+// PeerStateChange message for peer topic
+message PeerStateChange {
+    string peer = 1;
+    string state = 2;
+}
