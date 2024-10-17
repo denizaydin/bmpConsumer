@@ -42,7 +42,7 @@ func (r *RedisClient) Cache(ctx context.Context, key string, value string) (bool
 	existingValue, err := r.client.Get(ctx, key).Result()
 	if err == redis.Nil {
 		// Key doesn't exist, insert it into Redis
-		if err := r.client.Set(ctx, key, value, time.Duration(30)*time.Minute).Err(); err != nil {
+		if err := r.client.Set(ctx, key, value, time.Duration(1800)*time.Hour).Err(); err != nil {
 			glog.Errorf("error %s while inserting key %s with value %s", err, key, value)
 			return false, err
 		}
@@ -54,14 +54,14 @@ func (r *RedisClient) Cache(ctx context.Context, key string, value string) (bool
 	} else {
 		if value == existingValue {
 			// key exists, just update the TTL
-			if err := r.client.Expire(ctx, key, time.Duration(30)*time.Minute).Err(); err != nil {
+			if err := r.client.Expire(ctx, key, time.Duration(1800)*time.Hour).Err(); err != nil {
 				return false, err
 			}
 			glog.Infof("key %s already exists with value %s, TTL updated", key, existingValue)
 			return false, nil
 		} else {
 			// Key exists but value is different, update the value and TTL
-			if err := r.client.Set(ctx, key, value, time.Duration(30)*time.Minute).Err(); err != nil {
+			if err := r.client.Set(ctx, key, value, time.Duration(1800)*time.Hour).Err(); err != nil {
 				glog.Errorf("could not update key %s: %v", key, err)
 				return false, err
 			}

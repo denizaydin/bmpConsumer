@@ -13,17 +13,14 @@ import (
 
 // creates manegement IP address from BGPID using igpNetwork to details.MGMTNetworkwr returns the "" if no match.
 func MgmtIPfromBGPID(asNumber uint32, bgpid string, nmap *cfg.NetworkMap) string {
-
-	glog.Infof("tring to convert bgpid:%s and as number:%v", bgpid, asNumber)
+	glog.Infof("tring to convert bgpid:%s to a management ip using as number:%v", bgpid, asNumber)
 	for baseAs, details := range *nmap {
 		if asNumber == baseAs {
-			glog.Infof("found mapping for AS: %v, IGP Network: %s, MGMT Network: %s\n", asNumber, details.IGPNetwork, details.MGMTNetwork)
+			glog.Infof("found exact mapping for AS: %v, IGP Network: %s, MGMT Network: %s\n", asNumber, details.IGPNetwork, details.MGMTNetwork)
 			return converBGPID2MGMTIP(bgpid, details.IGPNetwork, details.MGMTNetwork)
 		}
 	}
 	lastThreeDigits := asNumber % 1000
-	glog.Infof("tring to convert bgpid:%s and as number:%v", bgpid, lastThreeDigits)
-
 	if lastThreeDigits > 0 && lastThreeDigits <= 99 {
 		for baseAs, details := range *nmap {
 			asstr := strconv.FormatUint(uint64(asNumber), 10)
@@ -42,6 +39,7 @@ func MgmtIPfromBGPID(asNumber uint32, bgpid string, nmap *cfg.NetworkMap) string
 
 // GetBGPIDfromAS returns bgp from as number for leaf types
 func GetBGPIDfromAS(asNumber uint32, nmap *cfg.NetworkMap) (string, error) {
+	glog.Infof("tring to calculate bgpid for the as number:%v", asNumber)
 	for baseAs, details := range *nmap {
 		if asNumber == baseAs {
 			glog.Infof("found mapping for AS: %v, IGP Network: %s, MGMT Network: %s\n", asNumber, details.IGPNetwork, details.MGMTNetwork)
@@ -71,7 +69,7 @@ func GetBGPIDfromAS(asNumber uint32, nmap *cfg.NetworkMap) (string, error) {
 				return bgpID, nil
 			}
 		}
-		return "", fmt.Errorf("not matched to any networkf")
+		return "", fmt.Errorf("as %v not matched to any network", asNumber)
 	}
 	return "", fmt.Errorf("not a leaf:%v, last three digit:%v", asNumber, lastThreeDigits)
 }

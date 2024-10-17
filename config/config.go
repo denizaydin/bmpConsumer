@@ -84,7 +84,9 @@ func LoadConfig() (Config, error) {
 
 	// Log the loaded configuration
 	glog.Infof("Loaded configuration: Kafka Broker=%s, Kafka GroupID=%s, Redis Address=%s, Neo4j Address=%s", kafkaBroker, kafkaGroupID, redisAddress, neo4jAddress)
-
+	if len(networkMap) == 0 {
+		glog.Warning("empty networkmap")
+	}
 	// Example: Walk through the map and print the AS numbers and their details
 	for asNumber, details := range networkMap {
 		glog.Infof("AS: %v, IGP Network: %s, MGMT Network: %s\n", asNumber, details.IGPNetwork, details.MGMTNetwork)

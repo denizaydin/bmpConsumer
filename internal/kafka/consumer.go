@@ -1,3 +1,8 @@
+/*
+consumer, consumes gobmp evpn prefix messages written into kakfa by a gobmp client. It tries to build a logical map of the data center network and servers.
+In our setup we are retrving information not directly from the devices. Thus we can not get enough information about the source of the BGP update like BGP id e.t.c.
+This may a problem while binding the prefix e.t.c to a remote peer if we have multiplepaths. It is not possible which of the remote peer is advertising the a particular multipath candidate (BGP anycast)
+*/
 package consumer
 
 import (
@@ -46,7 +51,7 @@ type Consumer struct {
 type ProcessEVPNPrefixFunc func(ctx context.Context, redisClient *redis.RedisClient, evpnPrefix *message.EVPNPrefix, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) error
 
 var processFuncMap = map[uint8]ProcessEVPNPrefixFunc{
-	2: processEVPNType2Prefix,
+	//	2: processEVPNType2Prefix,
 	3: processEVPNType3Prefix,
 	5: processEVPNType5Prefix,
 }
@@ -75,105 +80,72 @@ func (c *Consumer) Close() {
 
 // ProcessMessages consumes messages from Kafka and processes them
 func (c *Consumer) ProcessMessages(ctx context.Context, topics []string, r *redis.RedisClient, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) {
+	// Subscribe to topics
 	err := c.kafkaConsumer.SubscribeTopics(topics, nil)
 	if err != nil {
 		glog.Fatalf("failed to subscribe to topics: %v", err)
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			glog.Info("received shutdown signal, stopping message processing...")
-			return
-		default:
-			msg, err := c.kafkaConsumer.ReadMessage(100 * time.Millisecond) // Use a short timeout for graceful shutdown
-			if err != nil {
-				if kafkaError, ok := err.(kafka.Error); ok && kafkaError.Code() == kafka.ErrTimedOut {
+	// Graceful shutdown setup: create a channel to listen for context cancellation
+	messageProcessingDone := make(chan struct{})
+
+	// Goroutine for message processing
+	go func() {
+		defer close(messageProcessingDone)
+		for {
+			select {
+			case <-ctx.Done(): // context has been cancelled or timeout
+				glog.Info("received shutdown signal, stopping message processing...")
+				return
+			default:
+				// Read a message from Kafka with a timeout
+				msg, err := c.kafkaConsumer.ReadMessage(100 * time.Millisecond) // Use a short timeout for graceful shutdown
+				if err != nil {
+					if kafkaError, ok := err.(kafka.Error); ok && kafkaError.Code() == kafka.ErrTimedOut {
+						continue
+					}
+					glog.Errorf("error reading message: %v", err) // should we backoff or retry?
 					continue
 				}
-				glog.Errorf("error reading message: %v", err)
-				continue
-			}
 
-			// Process based on topic
-			switch *msg.TopicPartition.Topic {
-			case "gobmp.parsed.peer":
-				glog.Infof("handling msg:%v from topic:%v", msg.Value, *msg.TopicPartition.Topic)
-				processPeerMessage(ctx, msg.Value, r, neo4j, nmap)
-			case "gobmp.parsed.evpn":
-				glog.Infof("handling msg:%v from topic:%v", msg.Value, *msg.TopicPartition.Topic)
-				processEVPNPrefix(ctx, msg.Value, r, neo4j, nmap)
-			default:
-				glog.Errorf("unhandled topic:%v", *msg.TopicPartition.Topic)
+				// Process the message based on the topic
+				switch *msg.TopicPartition.Topic {
+				case "gobmp.parsed.evpn":
+					glog.Infof("handling msg: %v from topic: %v", msg.Value, *msg.TopicPartition.Topic)
+					processEVPNPrefix(ctx, msg.Value, r, neo4j, nmap)
+				default:
+					glog.Errorf("unhandled topic: %v", *msg.TopicPartition.Topic)
+				}
 			}
 		}
-	}
+	}()
+
+	// Wait for message processing to stop when the context is done
+	<-ctx.Done()
+	glog.Info("context cancelled, waiting for message processing to stop...")
+	<-messageProcessingDone // Wait for the goroutine to finish
+	glog.Info("message processing stopped")
 }
 
-// processPeerMessage Deserialize and process peer message (PeerStateChange)
-func processPeerMessage(ctx context.Context, data []byte, redisClient *redis.RedisClient, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) {
-	var peerMessage *message.PeerStateChange
-	err := json.Unmarshal(data, &peerMessage)
-	if err != nil {
-		glog.Errorf("failed to deserialize PeerStateChange: %v", err)
-		return
-	}
-	// Only interested in "up" messages
-	if peerMessage.Action == "down" {
-		glog.Infof("unhandled peer down message")
-		return
-	}
-
-	// Create and cache remote node
-	remoteNode := Node{
-		Type:       tools.GetNodeType(peerMessage.RemoteASN),
-		Name:       strconv.FormatUint(uint64(peerMessage.RemoteASN), 10),
-		ID:         peerMessage.RemoteBGPID,
-		Status:     "up",
-		Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(peerMessage.RemoteASN, peerMessage.RemoteBGPID, nmap)}},
-	}
-	processNode(ctx, redisClient, neo4j, &remoteNode)
-
-	// Create and cache local node
-	localNode := Node{
-		Type:       tools.GetNodeType(peerMessage.LocalASN),
-		Name:       strconv.FormatUint(uint64(peerMessage.LocalASN), 10),
-		ID:         peerMessage.LocalBGPID,
-		Status:     "up",
-		Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(peerMessage.LocalASN, peerMessage.LocalBGPID, nmap)}},
-	}
-	processNode(ctx, redisClient, neo4j, &localNode)
-
-	// Cache Edge between local and remote ASN
-	if peerMessage.LocalASN > peerMessage.RemoteASN {
-		processEdge(ctx, redisClient, &remoteNode, &localNode, neo4j, "up")
-		return
-	}
-	processEdge(ctx, redisClient, &localNode, &remoteNode, neo4j, "up")
-
-}
-
-// Deserialize and process EVPN message (EVPNPrefix)
-func processEVPNPrefix(ctx context.Context, data []byte, redisClient *redis.RedisClient, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) {
+// processEVPNPrefix deserialize and process EVPN message (EVPNPrefix)
+func processEVPNPrefix(ctx context.Context, data []byte, redisClient *redis.RedisClient, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) error {
 	var evpnPrefix *message.EVPNPrefix
 	err := json.Unmarshal(data, &evpnPrefix)
 	if err != nil {
-		glog.Errorf("failed to deserialize evpn prefix: %v", err)
-		return
+		return fmt.Errorf("failed to deserialize evpn prefix: %v", err)
 	}
-	// Continue processing the message...
-	// currently only evpn route-type 2 is processed
 	if processFunc, ok := processFuncMap[evpnPrefix.RouteType]; ok {
-		glog.Infof("processing message : %+v", evpnPrefix)
 		err = processFunc(ctx, redisClient, evpnPrefix, neo4j, nmap)
 		if err != nil {
-			glog.Errorf("error processing evpn route-type %d message: %v", evpnPrefix.RouteType, err)
+			return fmt.Errorf("error processing evpn route type %d message: %v", evpnPrefix.RouteType, err)
 		}
-		return
+		return nil
 	} else {
-		glog.Infof("unsupported route-type: %+v", evpnPrefix.RouteType)
+		return fmt.Errorf("unsupported route type %+v", evpnPrefix.RouteType)
 	}
 }
+
+// processEVPNType2Prefix handles BGP EVPN Type 2 NLRI which includes host/mac/server information
 func processEVPNType2Prefix(ctx context.Context, redisClient *redis.RedisClient, message *message.EVPNPrefix, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) error {
 	glog.Infof("processing message: %v", message)
 	// EVPN Route-Type 2 contains information about the attached hosts.
@@ -196,7 +168,7 @@ func processEVPNType2Prefix(ctx context.Context, redisClient *redis.RedisClient,
 
 	//some values are only included in prefix add/up bgp updates like BaseAttributes.ASPath[1], remoteASN, as-path e.t.c
 	if status == "up" {
-		// we can say that out peer is up and set our hostleaf to remote peer
+		// in our design remotePeer is a Spine
 		remotePeer := Node{
 			Type:       tools.GetNodeType(message.PeerASN),
 			Name:       strconv.FormatUint(uint64(message.PeerASN), 10),
@@ -204,11 +176,10 @@ func processEVPNType2Prefix(ctx context.Context, redisClient *redis.RedisClient,
 			Status:     status,
 			Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(message.PeerASN, message.RemoteBGPID, nmap)}},
 		}
-
 		processNode(ctx, redisClient, neo4j, &remotePeer)
-		hostleaf := remotePeer //assuming that remotePeer is the origin of the update
-		// remote peer is not the origion of the update, we should process the origin as as well
-		if message.PeerASN != uint32(message.OriginAS) {
+
+		// check origin-as, it should not be sth and we must know its bgp-id which should be unique inside the data center and it can be used as id the database
+		if message.OriginAS > 0 {
 			originBGPID, err := tools.GetBGPIDfromAS(uint32(message.OriginAS), nmap)
 			if err == nil {
 				originAS := Node{
@@ -219,11 +190,10 @@ func processEVPNType2Prefix(ctx context.Context, redisClient *redis.RedisClient,
 					Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(uint32(message.OriginAS), originBGPID, nmap)}},
 				}
 				processNode(ctx, redisClient, neo4j, &originAS)
-				hostleaf = originAS
-				// Our peer and origin as are directly connected. As we have enough information, bgpid, about origin as we can connect them
-				processEdge(ctx, redisClient, &host, &hostleaf, neo4j, "up")
+				// binding origin-as, leaf and host
+				processEdge(ctx, redisClient, &host, &originAS, neo4j, "up")
+				// binding remote-as and origin-as (spine and leaf)
 				if message.BaseAttributes.ASPathCount == 2 {
-					// Cache Edge between local and remote ASN as they are directly connected and we have enough information about the originAS, bgpid
 					if message.PeerASN > uint32(message.OriginAS) {
 						processEdge(ctx, redisClient, &originAS, &remotePeer, neo4j, "up")
 					} else {
@@ -234,8 +204,6 @@ func processEVPNType2Prefix(ctx context.Context, redisClient *redis.RedisClient,
 				glog.Errorf("failed to find bgpid for the origin as: %v, can not bind host", err)
 			}
 		}
-		processEdge(ctx, redisClient, &host, &hostleaf, neo4j, "up")
-		//if peer as == origin as than we can create an edge between them, but as edges should be handled by the peer messages not a bgp updates.
 	}
 
 	// evpn route-type 2 with ip address, mac-ip update
@@ -257,172 +225,212 @@ func processEVPNType2Prefix(ctx context.Context, redisClient *redis.RedisClient,
 	}
 	return nil
 }
+
+// processEVPNType3Prefix handles BGP EVPN Type 3 NLRI basically all leafs or vxlan end points in the EVPN domain.
 func processEVPNType3Prefix(ctx context.Context, redisClient *redis.RedisClient, message *message.EVPNPrefix, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) error {
 	glog.Infof("processing message: %v", message)
-
-	status := "down"
-	if message.Action == "add" {
-		status = "up"
-	}
-	//some values are only included in prefix add/up bgp updates like originAS, remoteASN, as-path e.t.c
-	if status == "up" {
-		// we can say that out peer is up and set our hostleaf to remote peer
+	if message.Action == "add" && message.BaseAttributes.ASPathCount == 2 {
 		remotePeer := Node{
 			Type:       tools.GetNodeType(message.PeerASN),
 			Name:       strconv.FormatUint(uint64(message.PeerASN), 10),
 			ID:         message.RemoteBGPID,
-			Status:     status,
+			Status:     "up",
 			Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(message.PeerASN, message.RemoteBGPID, nmap)}},
 		}
-
 		processNode(ctx, redisClient, neo4j, &remotePeer)
-		// remote peer is not the origion of the update, we should process the origin as as well
-		if message.PeerASN != uint32(message.OriginAS) {
-			originBGPID, err := tools.GetBGPIDfromAS(uint32(message.OriginAS), nmap)
-			if err == nil {
-				originAS := Node{
-					Type:       tools.GetNodeType(uint32(message.OriginAS)),
-					Name:       strconv.FormatUint(uint64(uint32(message.OriginAS)), 10),
-					ID:         originBGPID,
-					Status:     status,
-					Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(uint32(message.OriginAS), originBGPID, nmap)}},
-				}
-				processNode(ctx, redisClient, neo4j, &originAS)
-				if message.BaseAttributes.ASPathCount == 2 {
-					// Cache Edge between local and remote ASN as they are directly connected and we have enough information about the originAS, bgpid
-					if message.PeerASN > uint32(message.OriginAS) {
-						processEdge(ctx, redisClient, &originAS, &remotePeer, neo4j, "up")
-					} else {
-						processEdge(ctx, redisClient, &remotePeer, &originAS, neo4j, "up")
-					}
-				}
-			} else {
-				glog.Errorf("failed to find bgpid for the origin as: %v, can not bind host", err)
+
+		originBGPID, err := tools.GetBGPIDfromAS(message.BaseAttributes.ASPath[1], nmap)
+		//We need an id for node for insterting into database
+		if err == nil {
+			originAS := Node{
+				Type:       tools.GetNodeType(message.BaseAttributes.ASPath[1]),
+				Name:       strconv.FormatUint(uint64(message.BaseAttributes.ASPath[1]), 10),
+				ID:         originBGPID,
+				Status:     "up",
+				Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(message.BaseAttributes.ASPath[1], originBGPID, nmap)}},
 			}
+			processNode(ctx, redisClient, neo4j, &originAS)
+			if message.BaseAttributes.ASPathCount == 2 {
+				if message.PeerASN > uint32(message.OriginAS) {
+					processEdge(ctx, redisClient, &originAS, &remotePeer, neo4j, "up")
+				} else {
+					processEdge(ctx, redisClient, &remotePeer, &originAS, neo4j, "up")
+				}
+			}
+			return nil
+		} else {
+			return fmt.Errorf("failed to find bgpid for the origin as: %v, can not bind host", err)
 		}
 	}
-	return nil
+	return fmt.Errorf("as path count is more than in our structure, message: %v", message)
 }
+
+// processEVPNType5Prefix handles BGP EVPN Type 5 NLRI, external information and connected ip interfaces/networks
 func processEVPNType5Prefix(ctx context.Context, redisClient *redis.RedisClient, message *message.EVPNPrefix, neo4j *neo4j.DriverWithContext, nmap *cfg.NetworkMap) error {
-	glog.Infof("processing message: %v", message)
-
-	status := "down"
 	if message.Action == "add" {
-		status = "up"
-	}
-	//some values are only included in prefix add/up bgp updates like originAS, remoteASN, as-path e.t.c
-	if status == "up" {
-		// we can say that out peer is up and set our hostleaf to remote peer
-		remotePeer := Node{
-			Type:       tools.GetNodeType(message.PeerASN),
-			Name:       strconv.FormatUint(uint64(message.PeerASN), 10),
-			ID:         message.RemoteBGPID,
-			Status:     status,
-			Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(message.PeerASN, message.RemoteBGPID, nmap)}},
-		}
+		//We are not instrested in spine connected prefixes.
+		if message.BaseAttributes.ASPathCount > 1 {
+			for i := 0; i < len(message.BaseAttributes.ASPath)-1; i++ {
+				sourceAS := message.BaseAttributes.ASPath[i]
+				destinationAS := message.BaseAttributes.ASPath[i+1]
 
-		processNode(ctx, redisClient, neo4j, &remotePeer)
-		// remote peer is not the origion of the update, we should process the origin as as well
-		if message.PeerASN != uint32(message.OriginAS) {
-			originBGPID, err := tools.GetBGPIDfromAS(uint32(message.OriginAS), nmap)
-			if err == nil {
-				originAS := Node{
-					Type:       tools.GetNodeType(uint32(message.OriginAS)),
-					Name:       strconv.FormatUint(uint64(uint32(message.OriginAS)), 10),
-					ID:         originBGPID,
-					Status:     status,
-					Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(uint32(message.OriginAS), originBGPID, nmap)}},
-				}
-				processNode(ctx, redisClient, neo4j, &originAS)
-				if message.IPAddress != "" {
-					if tools.GetNodeType(uint32(message.OriginAS)) == "LEAF" {
-						//Create prefix and bind it to origin
+				if isIntraFabric(sourceAS, destinationAS) {
+					glog.Infof("intra fabric link source/spine as:%v destination as:%v", sourceAS, destinationAS)
+					var sourceBGPID string
+					if i == 0 {
+						//first as must be remote peer/spine
+						sourceBGPID = message.RemoteBGPID
+					} else {
+						bgpid, err := tools.GetBGPIDfromAS(sourceAS, nmap)
+						if err != nil {
+							if tools.GetNodeType(sourceAS) != "LEAF" && tools.GetNodeType(sourceAS) != "SPINE" {
+								sourceBGPID = bgpid
+							} else {
+								return fmt.Errorf("can not set bgp id for destination as:%v and nodeType:%v", sourceAS, tools.GetNodeType(sourceAS))
+							}
+						}
+					}
+
+					destinationBGPID, err := tools.GetBGPIDfromAS(destinationAS, nmap)
+					if err != nil {
+						if tools.GetNodeType(destinationAS) != "LEAF" && tools.GetNodeType(destinationAS) != "SPINE" {
+							destinationBGPID = strconv.FormatUint(uint64(destinationAS), 10)
+						} else {
+							return fmt.Errorf("can not set bgp id for destination as:%v and nodeType:%v", destinationAS, tools.GetNodeType(destinationAS))
+						}
+					}
+
+					source := Node{
+						Type:       tools.GetNodeType(sourceAS),
+						Name:       strconv.FormatUint(uint64(sourceAS), 10),
+						ID:         sourceBGPID,
+						Status:     "up",
+						Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(sourceAS, message.RemoteBGPID, nmap)}},
+					}
+					processNode(ctx, redisClient, neo4j, &source)
+
+					destination := Node{
+						Type:       tools.GetNodeType(destinationAS),
+						Name:       strconv.FormatUint(uint64(destinationAS), 10),
+						ID:         destinationBGPID,
+						Status:     "up",
+						Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(destinationAS, destinationBGPID, nmap)}},
+					}
+
+					processNode(ctx, redisClient, neo4j, &destination)
+					processEdge(ctx, redisClient, &destination, &source, neo4j, "up")
+
+					if i == len(message.BaseAttributes.ASPath)-2 {
 						ipkey := message.IPAddress + "/" + fmt.Sprintf("%d", message.IPLength)
 						//create or update node for prefix
 						prefix := Node{
 							Type:   "PREFIX",
 							Name:   ipkey,
 							ID:     ipkey,
-							Status: status,
+							Status: "up",
 							Properties: []Attribute{
 								{Name: "Prefix", Value: message.IPAddress},
 								{Name: "Length", Value: strconv.FormatUint(uint64(message.IPLength), 10)},
 							},
 						}
 						processNode(ctx, redisClient, neo4j, &prefix)
-						processEdge(ctx, redisClient, &prefix, &originAS, neo4j, status)
+						processEdge(ctx, redisClient, &prefix, &destination, neo4j, "up")
 					}
-				}
-				if message.BaseAttributes.ASPathCount == 2 {
-					// Cache Edge between local and remote ASN as they are directly connected and we have enough information about the originAS, bgpid
-					if message.PeerASN > uint32(message.OriginAS) {
-						processEdge(ctx, redisClient, &originAS, &remotePeer, neo4j, "up")
-					} else {
-						processEdge(ctx, redisClient, &remotePeer, &originAS, neo4j, "up")
-					}
-				}
-			} else {
-				glog.Errorf("failed to find bgpid for the origin as: %v, can not bind host", err)
-			}
-			// update from other fabrics
-			if message.BaseAttributes.ASPathCount > 2 {
-				if message.PeerASN == message.BaseAttributes.ASPath[0] {
-					if tools.GetNodeType(message.BaseAttributes.ASPath[1]) == "SUPERSPINE" {
-						//create super spine and give it a number correponding to current peer/spine
-						parsedIPParts := strings.Split(message.RemoteBGPID, ".")
-						SuperSpine := Node{
-							Type:   tools.GetNodeType(message.BaseAttributes.ASPath[1]),
-							Name:   strconv.FormatUint(uint64(message.BaseAttributes.ASPath[1]), 10),
-							ID:     parsedIPParts[3],
-							Status: status,
-						}
-						processNode(ctx, redisClient, neo4j, &SuperSpine)
-						processEdge(ctx, redisClient, &remotePeer, &SuperSpine, neo4j, "up")
-					}
-				}
-				if message.BaseAttributes.ASPathCount == 3 && tools.GetNodeType(message.BaseAttributes.ASPath[1]) == "LEAF" {
-					leafbgpid, err := tools.GetBGPIDfromAS(message.BaseAttributes.ASPath[1], nmap)
-					if err == nil {
-						leaf := Node{
-							Type:   "LEAF",
-							Name:   strconv.FormatUint(uint64(message.BaseAttributes.ASPath[1]), 10),
-							ID:     leafbgpid,
-							Status: status,
-						}
-						processNode(ctx, redisClient, neo4j, &leaf)
-						leafConnectedAS := Node{
-							Type:   tools.GetNodeType(message.BaseAttributes.ASPath[2]),
-							Name:   strconv.FormatUint(uint64(message.BaseAttributes.ASPath[2]), 10),
-							ID:     strconv.FormatUint(uint64(message.BaseAttributes.ASPath[2]), 10),
-							Status: status,
-						}
-						processNode(ctx, redisClient, neo4j, &leafConnectedAS)
-						processEdge(ctx, redisClient, &leaf, &leafConnectedAS, neo4j, "up")
 
+				}
+				if isInterFabric(sourceAS, destinationAS) {
+					glog.Infof("inter fabric link source/spine as:%v destination as:%v", sourceAS, destinationAS)
+					//interfabris requires different handling depending on the interfabric design! full-mesh other?
+					//we can only build interfabric links if know source and destination node id(bgpid) as we are using same as numbers on spine and superspines
+					//in our design remotePeer is a Spine
+					source := Node{
+						Type:       tools.GetNodeType(message.PeerASN),
+						Name:       strconv.FormatUint(uint64(message.PeerASN), 10),
+						ID:         message.RemoteBGPID,
+						Status:     "up",
+						Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(message.PeerASN, message.RemoteBGPID, nmap)}},
+					}
+					processNode(ctx, redisClient, neo4j, &source)
+					//dedicated id for each superspine corresponing the spine
+					parsedIPParts := strings.Split(message.RemoteBGPID, ".")
+					destination := Node{
+						Type:       tools.GetNodeType(destinationAS),
+						Name:       strconv.FormatUint(uint64(destinationAS), 10),
+						ID:         parsedIPParts[3],
+						Status:     "up",
+						Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(destinationAS, message.RemoteBGPID, nmap)}},
+					}
+					processNode(ctx, redisClient, neo4j, &destination)
+					processEdge(ctx, redisClient, &source, &destination, neo4j, "up")
+					/* full mesh inter-site
+					create mergeEdge function that will add links between each source and destination
+					MATCH (spine:Spine), (superspine:SuperSpine)
+					WHERE spine.superSpineID = superspine.ID
+					CREATE (spine)-[:CONNECTS_TO]->(superspine)
+					*/
+					return nil
+				}
+
+				if !isPrivateASN(destinationAS) {
+					glog.Infof("public link source/spine as:%v destination as:%v", sourceAS, destinationAS)
+
+					//assume source is public asn
+					source := Node{
+						Type:   tools.GetNodeType(sourceAS),
+						Name:   strconv.FormatUint(uint64(sourceAS), 10),
+						ID:     strconv.FormatUint(uint64(sourceAS), 10),
+						Status: "up",
+					}
+					if isPrivateASN(sourceAS) {
+						sourceBGPID, sourceErr := tools.GetBGPIDfromAS(sourceAS, nmap)
+						if sourceErr != nil {
+							if tools.GetNodeType(sourceAS) != "LEAF" && tools.GetNodeType(sourceAS) != "SPINE" {
+								sourceBGPID = strconv.FormatUint(uint64(sourceAS), 10)
+							} else {
+								return fmt.Errorf("can not set bgp id for source as:%v and nodeType:%v", sourceAS, tools.GetNodeType(sourceAS))
+							}
+						}
+						source = Node{
+							Type:       tools.GetNodeType(sourceAS),
+							Name:       strconv.FormatUint(uint64(sourceAS), 10),
+							ID:         sourceBGPID,
+							Status:     "up",
+							Properties: []Attribute{{Name: "MGMT_IP", Value: tools.MgmtIPfromBGPID(sourceAS, sourceBGPID, nmap)}},
+						}
+					}
+					destination := Node{
+						Type:   "public",
+						Name:   strconv.FormatUint(uint64(destinationAS), 10),
+						ID:     strconv.FormatUint(uint64(destinationAS), 10),
+						Status: "up",
+					}
+					processNode(ctx, redisClient, neo4j, &source)
+					processNode(ctx, redisClient, neo4j, &destination)
+					processEdge(ctx, redisClient, &destination, &source, neo4j, "up")
+
+					if i+1 == len(message.BaseAttributes.ASPath)-1 {
 						ipkey := message.IPAddress + "/" + fmt.Sprintf("%d", message.IPLength)
 						//create or update node for prefix
 						prefix := Node{
 							Type:   "PREFIX",
 							Name:   ipkey,
 							ID:     ipkey,
-							Status: status,
+							Status: "up",
 							Properties: []Attribute{
 								{Name: "Prefix", Value: message.IPAddress},
 								{Name: "Length", Value: strconv.FormatUint(uint64(message.IPLength), 10)},
 							},
 						}
 						processNode(ctx, redisClient, neo4j, &prefix)
-						processEdge(ctx, redisClient, &prefix, &leafConnectedAS, neo4j, status)
-					} else {
-						glog.Errorf("failed to find bgpid for the leaf as: %v, %v", message.BaseAttributes.ASPath[1], err)
+						processEdge(ctx, redisClient, &prefix, &destination, neo4j, "up")
 					}
 				}
 			}
 		}
-
 	}
 	return nil
 }
+
 func processNode(ctx context.Context, redisClient *redis.RedisClient, neo4j *neo4j.DriverWithContext, node *Node) {
 	// Convert the struct to a JSON string - we may use hash of value if we consider memory usage.
 	valueData, err := json.Marshal(node)
@@ -528,5 +536,53 @@ func mergeEdge(ctx context.Context, driver neo4j.DriverWithContext, edge *Edge) 
 		relationship := record.Values[0].(neo4j.Relationship)
 		glog.Infof("Merged Edge: ID=%v, Type=%v, Properties=%v\n", relationship.ElementId, relationship.Type, relationship.Props)
 	}
+}
 
+// isPrivateASN returns truee if its a private ASN number
+func isPrivateASN(asn uint32) bool {
+	privateRanges := [][2]uint32{
+		{64512, 65534},           // 16-bit private ASN range
+		{4200000000, 4294967294}, // 32-bit private ASN range
+	}
+
+	// Check if the ASN falls within any of the private ranges
+	for _, r := range privateRanges {
+		if asn >= r[0] && asn <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// isIntraFabric returns true if both as are in the same data center and same fabric
+func isIntraFabric(a, b uint32) bool {
+	if !isPrivateASN(a) || !isPrivateASN(b) {
+		return false
+	}
+	// Convert uint32 numbers to strings
+	strA := strconv.FormatUint(uint64(a), 10)
+	strB := strconv.FormatUint(uint64(b), 10)
+
+	// If either string is shorter than 10 characters, return false
+	if len(strA) < 10 || len(strB) < 10 {
+		return false
+	}
+	// Compare the first four characters of each string
+	return strA[:7] == strB[:7]
+}
+
+// isInterFabric return true if both as are in the same datacenter
+func isInterFabric(a, b uint32) bool {
+	if !isPrivateASN(a) || !isPrivateASN(b) {
+		return false
+	}
+	strA := strconv.FormatUint(uint64(a), 10)
+	strB := strconv.FormatUint(uint64(b), 10)
+
+	// If either string is shorter than 10 characters, return false
+	if len(strA) < 10 || len(strB) < 10 {
+		return false
+	}
+	// Compare the first four characters of each string
+	return (strA[:4] == strB[:4]) && (strA[:7] != strB[:7])
 }

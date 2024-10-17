@@ -8,6 +8,8 @@ var nodeTypeMap = map[uint16]string{
 	301: "SUPERSPINE",
 	302: "SUPERSPINE",
 	777: "LB",
+	666: "FW",
+	555: "WANROUTER",
 }
 
 // Function to extract the node type from AS number
